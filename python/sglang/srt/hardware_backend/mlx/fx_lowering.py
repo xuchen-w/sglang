@@ -300,6 +300,23 @@ def _lower_sdpa(mx, args, kwargs):
     enable_gqa = _arg(args, kwargs, 7, "enable_gqa", False)
     if dropout not in (None, 0, 0.0):
         raise UnsupportedMlxFxGraphError("SDPA dropout is unsupported")
+    if causal and attention_mask is not None:
+        raise UnsupportedMlxFxGraphError(
+            "SDPA causal attention with an explicit mask is unsupported"
+        )
+    output_dtype = query.dtype
+    if output_dtype not in (mx.float16, mx.bfloat16, mx.float32) or any(
+        tensor.dtype != output_dtype for tensor in (key, value)
+    ):
+        raise UnsupportedMlxFxGraphError(
+            "SDPA requires matching floating-point Q/K/V dtypes"
+        )
+    if attention_mask is not None and attention_mask.dtype not in (
+        mx.bool_,
+        mx.float32,
+        output_dtype,
+    ):
+        raise UnsupportedMlxFxGraphError("unsupported SDPA mask dtype")
     if enable_gqa:
         if any(tensor.ndim < 3 for tensor in (query, key, value)):
             raise UnsupportedMlxFxGraphError("SDPA GQA requires a head dimension")
@@ -319,6 +336,12 @@ def _lower_sdpa(mx, args, kwargs):
             key = mx.repeat(key, query_heads // key_heads, axis=-3)
         if query_heads != value_heads:
             value = mx.repeat(value, query_heads // value_heads, axis=-3)
+    # Match Torch's math SDPA accumulation and retain the query output dtype,
+    # including when a float32 additive mask accompanies fp16/bf16 inputs.
+    if output_dtype in (mx.float16, mx.bfloat16):
+        query, key, value = (
+            tensor.astype(mx.float32) for tensor in (query, key, value)
+        )
     scale = float(scale) if scale is not None else 1.0 / sqrt(query.shape[-1])
     scores = (query @ mx.swapaxes(key, -1, -2)) * scale
     if causal:
@@ -340,7 +363,7 @@ def _lower_sdpa(mx, args, kwargs):
     fully_masked = mx.all(scores == -float("inf"), axis=-1, keepdims=True)
     probabilities = mx.softmax(mx.where(fully_masked, 0, scores), axis=-1)
     probabilities = mx.where(fully_masked, 0, probabilities)
-    return probabilities @ value
+    return (probabilities @ value).astype(output_dtype)
 
 
 @_lowering("silu", aten=(torch.ops.aten.silu.default,), functions=(F.silu,))
