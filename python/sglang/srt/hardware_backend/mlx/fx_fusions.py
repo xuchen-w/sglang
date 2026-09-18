@@ -170,10 +170,13 @@ def _rope_match(root):
     return None
 
 
-def fuse_mlx_fx_graph(graph_module: GraphModule) -> MlxFxFusionResult:
+def fuse_mlx_fx_graph(
+    graph_module: GraphModule, *, eligible_nodes: set[str] | None = None
+) -> MlxFxFusionResult:
     """Return a graph copy with only semantically proven patterns replaced."""
     graph = copy.deepcopy(graph_module.graph)
     replacements = {}
+    removable = set()
     for root in list(graph.nodes):
         target, lowering = fused_rms_norm, "fused_rms_norm"
         match = _rms_norm_match(root)
@@ -183,20 +186,28 @@ def fuse_mlx_fx_graph(graph_module: GraphModule) -> MlxFxFusionResult:
         if match is None:
             continue
         args, intermediates = match
+        if eligible_nodes is not None and any(
+            node.name not in eligible_nodes for node in {*intermediates, root}
+        ):
+            continue
         # Export inserts metadata checks around dtype casts. The original
         # executor treats them as no-ops; retain every other outside user.
-        for node in list(graph.nodes):
-            if (
-                _is_op(node, _ATEN._assert_tensor_metadata.default)
-                and node.args[0] in intermediates
-                and not node.users
-            ):
-                graph.erase_node(node)
+        for intermediate in intermediates:
+            for user in list(intermediate.users):
+                if (
+                    _is_op(user, _ATEN._assert_tensor_metadata.default)
+                    and user.args[0] is intermediate
+                    and not user.users
+                ):
+                    graph.erase_node(user)
         root.target = target
         root.args = args
         replacements[root.name] = lowering
-    module = GraphModule(graph_module, graph)
-    graph.eliminate_dead_code()
+        removable.update(intermediates)
+    # Only erase the matched arithmetic. Unrelated custom functions may have
+    # side effects even when FX does not mark their unused result as impure.
+    for node in reversed(list(graph.nodes)):
+        if node in removable and not node.users:
+            graph.erase_node(node)
     graph.lint()
-    module.recompile()
-    return MlxFxFusionResult(module, replacements)
+    return MlxFxFusionResult(GraphModule(graph_module, graph), replacements)

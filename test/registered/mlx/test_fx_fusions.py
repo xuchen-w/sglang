@@ -92,6 +92,67 @@ def test_missing_metadata_leaves_pattern_unfused():
     assert all(n.lowering != "fused_rms_norm" for n in fuse_mlx_fx_plan(plan).nodes)
 
 
+def test_fusion_preserves_custom_registry_semantics():
+    value = torch.randn(2, 32)
+    original = _plan(_rms("qwen3", value.dtype), (value,))
+    registry = MlxFxLoweringRegistry.standard_export_decoder()
+    registry.register_function(torch.ops.aten.mul.Tensor, "custom_multiply")
+    plan = build_mlx_fx_plan(original.graph_module, registry)
+    fused = fuse_mlx_fx_plan(plan)
+    assert not any(node.lowering == "fused_rms_norm" for node in fused.nodes)
+    assert any(node.lowering == "custom_multiply" for node in fused.nodes)
+
+
+def test_fusion_does_not_erase_unrelated_unused_custom_calls():
+    calls = []
+
+    def side_effect(value):
+        calls.append(1)
+        return value
+
+    graph = torch.fx.Graph()
+    value = graph.placeholder("value")
+    graph.call_function(side_effect, (value,))
+    graph.output(value)
+    registry = MlxFxLoweringRegistry.standard_export_decoder()
+    registry.register_function(side_effect, "custom_side_effect")
+    plan = build_mlx_fx_plan(torch.fx.GraphModule({}, graph), registry)
+    fused = fuse_mlx_fx_plan(plan)
+    fused.graph_module(torch.ones(1))
+    assert calls == [1]
+    assert len(fused.nodes) == len(plan.nodes)
+
+
+def test_fusion_only_prunes_metadata_checks_on_matched_intermediates():
+    value = torch.randn(2, 32)
+    module = torch.nn.Sequential(_rms("qwen3", value.dtype), _rms("llama", value.dtype))
+    plan = _plan(module, (value,))
+    graph = plan.graph_module.graph
+    checks = set()
+    unrelated = None
+    for node in list(graph.nodes):
+        if node.op == "placeholder" or node.target == torch.ops.aten.pow.Tensor_Scalar:
+            with graph.inserting_after(node):
+                check = graph.call_function(
+                    torch.ops.aten._assert_tensor_metadata.default, (node,)
+                )
+            if node.op == "placeholder":
+                unrelated = check.name
+            else:
+                checks.add(check.name)
+    assert len(checks) == 2
+    plan.graph_module.recompile()
+    plan = build_mlx_fx_plan(
+        plan.graph_module, MlxFxLoweringRegistry.standard_export_decoder()
+    )
+    fused = fuse_mlx_fx_plan(plan)
+    names = {node.node_name for node in fused.nodes}
+    assert sum(node.lowering == "fused_rms_norm" for node in fused.nodes) == 2
+    assert unrelated in names
+    assert checks.isdisjoint(names)
+    torch.testing.assert_close(fused.graph_module(value), plan.graph_module(value))
+
+
 @_METAL
 @pytest.mark.parametrize("architecture", ["qwen3", "llama"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -207,3 +268,61 @@ def test_cached_rope_fused_unfused_and_torch_parity(dtype, layout):
                 torch.testing.assert_close(
                     result.cpu(), reference.cpu(), atol=tolerance, rtol=tolerance
                 )
+
+
+@_METAL
+@pytest.mark.parametrize("explicit_plan", [False, True])
+def test_fused_executor_keeps_original_attribute_owner(explicit_plan):
+    value = torch.randn(2, 32, device="mps")
+    plan = _plan(_rms("qwen3", value.dtype).to("mps"), (value,))
+    source = plan.graph_module
+    if explicit_plan:
+        plan = fuse_mlx_fx_plan(plan)
+    executor = make_mlx_fx_executor(plan, [value], fuse_patterns=not explicit_plan)
+    executor(value)
+    for replace in (False, True):
+        if replace:
+            source.weight = torch.nn.Parameter(torch.randn_like(source.weight))
+        else:
+            with torch.no_grad():
+                source.weight.add_(0.5)
+        actual = executor(value)[0]
+        expected = source(value)
+        torch.mps.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), atol=2e-6, rtol=2e-6)
+
+
+@_METAL
+@pytest.mark.parametrize("changed", ["shape", "dtype", "weight_dtype"])
+def test_fusion_rejects_changed_runtime_signature(changed):
+    value = torch.randn(2, 32, device="mps")
+    plan = _plan(_rms("qwen3", value.dtype).to("mps"), (value,))
+    executor = make_mlx_fx_executor(plan, [value], fuse_patterns=True)
+    if changed == "shape":
+        value = value[:1]
+    elif changed == "dtype":
+        value = value.half()
+    else:
+        plan.graph_module.weight = torch.nn.Parameter(plan.graph_module.weight.half())
+    with pytest.raises(RuntimeError, match="shape/dtype changed"):
+        executor(value)
+
+
+def test_fusion_keeps_shared_rms_intermediate_alive():
+    class Shared(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(32))
+
+        def forward(self, value):
+            promoted = value.float()
+            variance = promoted.pow(2).mean(-1, keepdim=True)
+            normalized = promoted * torch.rsqrt(variance + 1e-6)
+            return normalized.to(value.dtype) * self.weight, variance
+
+    value = torch.randn(2, 32)
+    plan = _plan(Shared(), (value,))
+    fused = fuse_mlx_fx_plan(plan)
+    assert any(node.lowering == "fused_rms_norm" for node in fused.nodes)
+    assert any(node.lowering == "mean" for node in fused.nodes)
+    torch.testing.assert_close(fused.graph_module(value), plan.graph_module(value))

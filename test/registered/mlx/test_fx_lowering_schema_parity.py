@@ -87,6 +87,7 @@ _RECIPES: dict[str, dict] = {
     ),
     "gelu": dict(args=lambda: (_t(4, 4),), pools={"approximate": ["tanh"]}),
     "relu": dict(args=lambda: (_t(4, 4),)),
+    "negative": dict(args=lambda: (_t(4, 4),)),
     "silu": dict(args=lambda: (_t(4, 4),)),
     "sigmoid": dict(args=lambda: (_t(4, 4),)),
     "tanh": dict(args=lambda: (_t(4, 4),)),

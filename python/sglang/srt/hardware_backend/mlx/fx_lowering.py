@@ -45,6 +45,7 @@ class MlxFxGraphPlan:
 
     graph_module: torch.fx.GraphModule
     nodes: tuple[MlxFxNodePlan, ...]
+    attribute_source: Optional[torch.fx.GraphModule] = None
 
     @property
     def unsupported(self) -> tuple[MlxFxNodePlan, ...]:
@@ -630,11 +631,16 @@ def make_mlx_fx_executor(
     if fuse_patterns:
         plan = fuse_mlx_fx_plan(plan)
     plan.require_fully_supported()
+    attribute_source = plan.attribute_source or plan.graph_module
+    has_fusions = any(
+        node.lowering in {"fused_rms_norm", "fused_rotary_embedding"}
+        for node in plan.nodes
+    )
     attr_nodes = tuple(
         node for node in plan.graph_module.graph.nodes if node.op == "get_attr"
     )
     attr_values = tuple(
-        _resolve_graph_attr(plan.graph_module, str(node.target)) for node in attr_nodes
+        _resolve_graph_attr(attribute_source, str(node.target)) for node in attr_nodes
     )
     # Parameters, buffers, and constant-tensor attributes ride as borrowed
     # views; non-tensor attributes (scalars, shapes) are captured by value.
@@ -680,6 +686,19 @@ def make_mlx_fx_executor(
     tensor_placeholder_nodes = tuple(
         placeholder_nodes[index] for index in tensor_positions
     )
+    # Fusion proofs describe fixed shapes and dtypes, including exported slice
+    # bounds. Reusing values/storage is safe; a new signature needs a new export.
+    fusion_signatures = []
+    if has_fusions:
+        for node in (*tensor_placeholder_nodes, *tensor_attr_nodes):
+            value = node.meta.get("val")
+            if not isinstance(value, torch.Tensor) or not all(
+                type(size) is int for size in value.shape
+            ):
+                raise UnsupportedMlxFxGraphError(
+                    "fused FX execution requires static tensor shape metadata"
+                )
+            fusion_signatures.append((tuple(value.shape), value.dtype))
 
     def mlx_graph(*arrays):
         runtime_arrays = arrays[: len(tensor_placeholder_nodes)]
@@ -718,8 +737,21 @@ def make_mlx_fx_executor(
             for index in tensor_positions
         ):
             raise RuntimeError("compiled MLX graph requires Torch MPS tensors")
-        for index, (node, view) in enumerate(zip(tensor_attr_nodes, attr_views)):
-            tensor = _resolve_graph_attr(plan.graph_module, str(node.target))
+        tensors = tuple(
+            _resolve_graph_attr(attribute_source, str(node.target))
+            for node in tensor_attr_nodes
+        )
+        if has_fusions:
+            current = tuple(torch_inputs[index] for index in tensor_positions) + tensors
+            if any(
+                not isinstance(tensor, torch.Tensor)
+                or (tuple(tensor.shape), tensor.dtype) != signature
+                for tensor, signature in zip(current, fusion_signatures)
+            ):
+                raise RuntimeError(
+                    "fused FX graph shape/dtype changed; export a new graph"
+                )
+        for index, (tensor, view) in enumerate(zip(tensors, attr_views)):
             if not view.matches(tensor):
                 attr_views[index] = MlxTensorView(tensor)
         return mlx_call_multi(
@@ -740,10 +772,17 @@ def fuse_mlx_fx_plan(plan: MlxFxGraphPlan) -> MlxFxGraphPlan:
     """
     from sglang.srt.hardware_backend.mlx.fx_fusions import fuse_mlx_fx_graph
 
-    fused = fuse_mlx_fx_graph(plan.graph_module)
     original = {node.node_name: node.lowering for node in plan.nodes}
+    standard = MlxFxLoweringRegistry.standard_export_decoder()
+    eligible = {
+        node.name
+        for node in plan.graph_module.graph.nodes
+        if standard.resolve(node) == original[node.name]
+    }
+    fused = fuse_mlx_fx_graph(plan.graph_module, eligible_nodes=eligible)
     return MlxFxGraphPlan(
         graph_module=fused.graph_module,
+        attribute_source=plan.attribute_source or plan.graph_module,
         nodes=tuple(
             MlxFxNodePlan(
                 node.name,
