@@ -648,9 +648,9 @@ def make_mlx_fx_executor(
         for node, value in zip(attr_nodes, attr_values)
         if not isinstance(value, torch.Tensor)
     }
-    attr_views = tuple(
+    attr_views = [
         MlxTensorView(value) for value in attr_values if isinstance(value, torch.Tensor)
-    )
+    ]
     placeholder_nodes = tuple(
         node for node in plan.graph_module.graph.nodes if node.op == "placeholder"
     )
@@ -718,10 +718,10 @@ def make_mlx_fx_executor(
             for index in tensor_positions
         ):
             raise RuntimeError("compiled MLX graph requires Torch MPS tensors")
-        for node, view in zip(tensor_attr_nodes, attr_views):
+        for index, (node, view) in enumerate(zip(tensor_attr_nodes, attr_views)):
             tensor = _resolve_graph_attr(plan.graph_module, str(node.target))
             if not view.matches(tensor):
-                view.refresh(tensor)
+                attr_views[index] = MlxTensorView(tensor)
         return mlx_call_multi(
             compiled_graph,
             *(torch_inputs[index] for index in tensor_positions),
