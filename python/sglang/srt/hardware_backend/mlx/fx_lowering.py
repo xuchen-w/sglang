@@ -246,6 +246,14 @@ def _lower_rms_norm(mx, args, kwargs):
     return mx.fast.rms_norm(value, weight, float(epsilon))
 
 
+@_lowering("fused_rms_norm")
+def _lower_fused_rms_norm(mx, args, kwargs):
+    # The exported HF variant rounds to the input dtype before multiplying
+    # by weight, unlike a single weighted RMSNorm operation.
+    value, weight, epsilon = args
+    return mx.fast.rms_norm(value, None, float(epsilon)) * weight
+
+
 @_lowering("layer_norm", aten=(torch.ops.aten.layer_norm.default,))
 def _lower_layer_norm(mx, args, kwargs):
     value, normalized_shape = args[:2]
@@ -600,12 +608,15 @@ def make_mlx_fx_executor(
     example_inputs: list[Any],
     *,
     shapeless: bool = False,
+    fuse_patterns: bool = False,
 ) -> Callable[..., Any]:
     """Build one compiled MLX callable for a fully admitted FX graph."""
     import mlx.core as mx
 
     from sglang.srt.utils.tensor_bridge import MlxTensorView, mlx_call_multi
 
+    if fuse_patterns:
+        plan = fuse_mlx_fx_plan(plan)
     plan.require_fully_supported()
     attr_nodes = tuple(
         node for node in plan.graph_module.graph.nodes if node.op == "get_attr"
@@ -707,6 +718,30 @@ def make_mlx_fx_executor(
         )
 
     return execute
+
+
+def fuse_mlx_fx_plan(plan: MlxFxGraphPlan) -> MlxFxGraphPlan:
+    """Copy and fuse proven subgraphs, preserving custom lowering mappings.
+
+    Consumers must execute the returned plan's graph, not zip the new nodes
+    with the original graph. The ordinary planner never rewrites graphs.
+    """
+    from sglang.srt.hardware_backend.mlx.fx_fusions import fuse_mlx_fx_graph
+
+    fused = fuse_mlx_fx_graph(plan.graph_module)
+    original = {node.node_name: node.lowering for node in plan.nodes}
+    return MlxFxGraphPlan(
+        graph_module=fused.graph_module,
+        nodes=tuple(
+            MlxFxNodePlan(
+                node.name,
+                node.op,
+                node.target,
+                fused.replacements.get(node.name, original[node.name]),
+            )
+            for node in fused.graph_module.graph.nodes
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -818,6 +853,7 @@ __all__ = [
     "UnsupportedMlxFxGraphError",
     "build_mlx_fx_plan",
     "export_mlx_plan",
+    "fuse_mlx_fx_plan",
     "make_mlx_decode_export_executor",
     "make_mlx_fx_executor",
     "make_mlx_prefill_export_executor",
