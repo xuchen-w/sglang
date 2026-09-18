@@ -22,6 +22,11 @@ import torch
 import torch.fx
 import torch.nn.functional as F
 
+from sglang.srt.hardware_backend.mlx.fx_validation import (
+    MLX_DTYPE_NAMES,
+    validate_graph,
+)
+
 
 class UnsupportedMlxFxGraphError(RuntimeError):
     """Raised when one FX graph cannot be lowered as a single MLX region."""
@@ -33,15 +38,20 @@ class MlxFxNodePlan:
     node_op: str
     target: Any
     lowering: Optional[str]
+    rejection_reason: Optional[str] = None
 
     @property
     def supported(self) -> bool:
-        return self.lowering is not None
+        return self.lowering is not None and self.rejection_reason is None
 
 
 @dataclass(frozen=True)
 class MlxFxGraphPlan:
-    """One captured forward and its operation-level MLX coverage."""
+    """Operation coverage and known metadata incompatibilities of one forward.
+
+    ``fully_supported`` means that no known incompatibility was found. It is
+    not a proof for ops without validators or missing/symbolic metadata.
+    """
 
     graph_module: torch.fx.GraphModule
     nodes: tuple[MlxFxNodePlan, ...]
@@ -58,10 +68,18 @@ class MlxFxGraphPlan:
         unsupported = self.unsupported
         if not unsupported:
             return
-        details = ", ".join(f"{node.node_op}:{node.target}" for node in unsupported)
+        details = ", ".join(
+            f"{node.node_name} ({node.node_op}:{node.target}): "
+            f"{node.rejection_reason or 'no registered lowering'}"
+            for node in unsupported
+        )
         raise UnsupportedMlxFxGraphError(
             "FX forward cannot run as one MLX region; unsupported nodes: " + details
         )
+
+    def for_inputs(self, example_inputs: Sequence[Any]) -> MlxFxGraphPlan:
+        """Recheck actual input metadata without trusting capture-time shapes."""
+        return _validated_plan(self.graph_module, self.nodes, example_inputs)
 
 
 class MlxFxLoweringRegistry:
@@ -120,11 +138,13 @@ class MlxFxLoweringRegistry:
 def build_mlx_fx_plan(
     graph_module: torch.fx.GraphModule,
     registry: MlxFxLoweringRegistry,
+    *,
+    example_inputs: Optional[Sequence[Any]] = None,
 ) -> MlxFxGraphPlan:
     """Classify a captured forward without inspecting its model architecture."""
-    return MlxFxGraphPlan(
-        graph_module=graph_module,
-        nodes=tuple(
+    return _validated_plan(
+        graph_module,
+        tuple(
             MlxFxNodePlan(
                 node_name=node.name,
                 node_op=node.op,
@@ -132,6 +152,32 @@ def build_mlx_fx_plan(
                 lowering=registry.resolve(node),
             )
             for node in graph_module.graph.nodes
+        ),
+        example_inputs,
+    )
+
+
+def _validated_plan(graph_module, nodes, example_inputs):
+    graph_nodes = tuple(graph_module.graph.nodes)
+    errors = validate_graph(
+        graph_module,
+        {node: item.lowering for node, item in zip(graph_nodes, nodes)},
+        _LOWERINGS,
+        _resolve_fx_value,
+        _resolve_graph_attr,
+        example_inputs,
+    )
+    return MlxFxGraphPlan(
+        graph_module,
+        tuple(
+            MlxFxNodePlan(
+                item.node_name,
+                item.node_op,
+                item.target,
+                item.lowering,
+                errors.get(node),
+            )
+            for node, item in zip(graph_nodes, nodes)
         ),
     )
 
@@ -560,18 +606,8 @@ def _lower_contiguous(mx, args, kwargs):
 
 
 def _mlx_dtype(dtype: torch.dtype, mx: Any) -> Any:
-    mapping = {
-        torch.bool: mx.bool_,
-        torch.int8: mx.int8,
-        torch.int16: mx.int16,
-        torch.int32: mx.int32,
-        torch.int64: mx.int64,
-        torch.float16: mx.float16,
-        torch.bfloat16: mx.bfloat16,
-        torch.float32: mx.float32,
-    }
     try:
-        return mapping[dtype]
+        return getattr(mx, MLX_DTYPE_NAMES[dtype])
     except KeyError as exc:
         raise UnsupportedMlxFxGraphError(
             f"Torch dtype has no MLX Metal lowering: {dtype}"
@@ -602,10 +638,7 @@ def make_mlx_fx_executor(
     shapeless: bool = False,
 ) -> Callable[..., Any]:
     """Build one compiled MLX callable for a fully admitted FX graph."""
-    import mlx.core as mx
-
-    from sglang.srt.utils.tensor_bridge import MlxTensorView, mlx_call_multi
-
+    plan = plan.for_inputs(example_inputs)
     plan.require_fully_supported()
     attr_nodes = tuple(
         node for node in plan.graph_module.graph.nodes if node.op == "get_attr"
@@ -625,9 +658,9 @@ def make_mlx_fx_executor(
         for node, value in zip(attr_nodes, attr_values)
         if not isinstance(value, torch.Tensor)
     }
-    attr_views = tuple(
-        MlxTensorView(value) for value in attr_values if isinstance(value, torch.Tensor)
-    )
+    constant_attr_signatures = {
+        node: _value_signature(value) for node, value in constant_attr_values.items()
+    }
     placeholder_nodes = tuple(
         node for node in plan.graph_module.graph.nodes if node.op == "placeholder"
     )
@@ -654,6 +687,13 @@ def make_mlx_fx_executor(
             "whole-graph MLX lowering requires normalization of used symbolic "
             f"scalar inputs: {names}"
         )
+    import mlx.core as mx
+
+    from sglang.srt.utils.tensor_bridge import MlxTensorView, mlx_call_multi
+
+    attr_views = tuple(
+        MlxTensorView(value) for value in attr_values if isinstance(value, torch.Tensor)
+    )
     tensor_placeholder_nodes = tuple(
         placeholder_nodes[index] for index in tensor_positions
     )
@@ -683,7 +723,10 @@ def make_mlx_fx_executor(
 
     compiled_graph = mx.compile(mlx_graph, shapeless=shapeless)
 
+    admitted_signature = _input_signature(example_inputs, attr_values)
+
     def execute(*torch_inputs):
+        nonlocal admitted_signature
         if len(torch_inputs) != len(placeholder_nodes):
             raise RuntimeError(
                 "compiled MLX graph input count changed: "
@@ -695,8 +738,24 @@ def make_mlx_fx_executor(
             for index in tensor_positions
         ):
             raise RuntimeError("compiled MLX graph requires Torch MPS tensors")
+        current_attrs = {
+            node: _resolve_graph_attr(plan.graph_module, str(node.target))
+            for node in attr_nodes
+        }
+        for node, current in current_attrs.items():
+            if (
+                node in constant_attr_signatures
+                and _value_signature(current) != constant_attr_signatures[node]
+            ):
+                raise UnsupportedMlxFxGraphError(
+                    f"captured constant attribute changed: {node.target}; rebuild the executor"
+                )
+        signature = _input_signature(torch_inputs, current_attrs.values())
+        if signature != admitted_signature:
+            plan.for_inputs(torch_inputs).require_fully_supported()
+            admitted_signature = signature
         for node, view in zip(tensor_attr_nodes, attr_views):
-            tensor = _resolve_graph_attr(plan.graph_module, str(node.target))
+            tensor = current_attrs[node]
             if not view.matches(tensor):
                 view.refresh(tensor)
         return mlx_call_multi(
@@ -707,6 +766,24 @@ def make_mlx_fx_executor(
         )
 
     return execute
+
+
+def _value_signature(value):
+    if isinstance(value, torch.Tensor):
+        shape = tuple(size if type(size) is int else None for size in value.shape)
+        return ("tensor", shape, value.dtype, value.device, value.layout)
+    if isinstance(value, (list, tuple)):
+        return (type(value), tuple(_value_signature(item) for item in value))
+    if isinstance(value, dict):
+        return (
+            dict,
+            tuple((key, _value_signature(item)) for key, item in value.items()),
+        )
+    return (type(value), value)
+
+
+def _input_signature(inputs, attrs):
+    return tuple(_value_signature(value) for value in (*inputs, *attrs))
 
 
 @dataclass(frozen=True)
@@ -778,7 +855,9 @@ class MlxFxCaptureBackend:
     def __call__(
         self, graph_module: torch.fx.GraphModule, example_inputs: list[Any]
     ) -> Callable[..., Any]:
-        plan = build_mlx_fx_plan(graph_module, self.registry)
+        plan = build_mlx_fx_plan(
+            graph_module, self.registry, example_inputs=example_inputs
+        )
         self.plans.append(plan)
         if self.report_path is not None:
             Path(self.report_path).write_text(
@@ -791,6 +870,7 @@ class MlxFxCaptureBackend:
                                 "op": node.node_op,
                                 "target": str(node.target),
                                 "lowering": node.lowering,
+                                "rejection_reason": node.rejection_reason,
                             }
                             for node in plan.nodes
                         ],
@@ -806,7 +886,49 @@ class MlxFxCaptureBackend:
             plan.require_fully_supported()
         if self.executor_factory is None:
             return graph_module.forward
-        return self.executor_factory(plan, example_inputs)
+        try:
+            executor = self.executor_factory(plan, example_inputs)
+        except UnsupportedMlxFxGraphError:
+            if self.fallback_to_torch:
+                return graph_module.forward
+            raise
+        if not self.fallback_to_torch:
+            return executor
+        attr_nodes = tuple(
+            node for node in graph_module.graph.nodes if node.op == "get_attr"
+        )
+        captured_constants = {
+            node: _value_signature(value)
+            for node in attr_nodes
+            if not isinstance(
+                value := _resolve_graph_attr(graph_module, str(node.target)),
+                torch.Tensor,
+            )
+        }
+        last_signature = None
+        admitted = False
+
+        def execute_or_fallback(*inputs):
+            nonlocal last_signature, admitted
+            attrs = tuple(
+                _resolve_graph_attr(graph_module, str(node.target))
+                for node in attr_nodes
+            )
+            if any(
+                node in captured_constants
+                and _value_signature(value) != captured_constants[node]
+                for node, value in zip(attr_nodes, attrs)
+            ):
+                return graph_module.forward(*inputs)
+            signature = _input_signature(inputs, attrs)
+            if signature != last_signature:
+                admitted = plan.for_inputs(inputs).fully_supported
+                last_signature = signature
+            if not admitted:
+                return graph_module.forward(*inputs)
+            return executor(*inputs)
+
+        return execute_or_fallback
 
 
 __all__ = [
