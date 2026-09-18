@@ -214,6 +214,30 @@ def test_generic_mlx_executor_observes_weight_mutation_and_replacement():
     not _HAS_WHOLE_GRAPH_MLX_RUNTIME,
     reason="requires Torch 2.13 and MLX on MPS",
 )
+def test_exported_executor_refreshes_replaced_attribute_without_recapture():
+    from sglang.srt.hardware_backend.mlx.fx_lowering import _resolve_graph_attr
+
+    model = torch.nn.Linear(8, 4, bias=False).to(device="mps").eval()
+    value = torch.randn(3, 8, device="mps")
+    graph = torch.export.export(model, (value,)).module(check_guards=False)
+    plan = build_mlx_fx_plan(graph, MlxFxLoweringRegistry.standard_export_decoder())
+    executor = make_mlx_fx_executor(plan, [value])
+    executor(value)
+    graph.weight = torch.nn.Parameter(torch.zeros_like(graph.weight))
+    with mock.patch(
+        "sglang.srt.hardware_backend.mlx.fx_lowering._resolve_graph_attr",
+        wraps=_resolve_graph_attr,
+    ) as resolve:
+        actual = executor(value)[0]
+        resolve.assert_called_once_with(graph, "weight")
+    torch.mps.synchronize()
+    torch.testing.assert_close(actual.cpu(), torch.zeros(3, 4))
+
+
+@pytest.mark.skipif(
+    not _HAS_WHOLE_GRAPH_MLX_RUNTIME,
+    reason="requires Torch 2.13 and MLX on MPS",
+)
 @pytest.mark.parametrize("architecture", ["qwen3", "llama"])
 def test_same_mlx_executor_runs_real_sglang_mlp_architectures(architecture):
     from sglang.srt.models.llama import LlamaMLP

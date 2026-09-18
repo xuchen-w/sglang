@@ -691,9 +691,9 @@ def make_mlx_fx_executor(
 
     from sglang.srt.utils.tensor_bridge import MlxTensorView, mlx_call_multi
 
-    attr_views = tuple(
+    attr_views = [
         MlxTensorView(value) for value in attr_values if isinstance(value, torch.Tensor)
-    )
+    ]
     tensor_placeholder_nodes = tuple(
         placeholder_nodes[index] for index in tensor_positions
     )
@@ -754,10 +754,10 @@ def make_mlx_fx_executor(
         if signature != admitted_signature:
             plan.for_inputs(torch_inputs).require_fully_supported()
             admitted_signature = signature
-        for node, view in zip(tensor_attr_nodes, attr_views):
+        for index, (node, view) in enumerate(zip(tensor_attr_nodes, attr_views)):
             tensor = current_attrs[node]
             if not view.matches(tensor):
-                view.refresh(tensor)
+                attr_views[index] = MlxTensorView(tensor)
         return mlx_call_multi(
             compiled_graph,
             *(torch_inputs[index] for index in tensor_positions),
