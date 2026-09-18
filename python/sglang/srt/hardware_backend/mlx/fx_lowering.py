@@ -254,6 +254,18 @@ def _lower_fused_rms_norm(mx, args, kwargs):
     return mx.fast.rms_norm(value, None, float(epsilon)) * weight
 
 
+@_lowering("negative", aten=(torch.ops.aten.neg.default,))
+def _lower_negative(mx, args, kwargs):
+    return -args[0]
+
+
+@_lowering("fused_rotary_embedding")
+def _lower_fused_rotary_embedding(mx, args, kwargs):
+    from sglang.srt.hardware_backend.mlx.rotary_kernel import cached_rotary_embedding
+
+    return cached_rotary_embedding(*args)
+
+
 @_lowering("layer_norm", aten=(torch.ops.aten.layer_norm.default,))
 def _lower_layer_norm(mx, args, kwargs):
     value, normalized_shape = args[:2]
