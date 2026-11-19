@@ -11,8 +11,10 @@ import msgspec
 import torch
 from torch.export.graph_signature import InputKind
 
-from sglang.kernels.ops.attention.mlx.radix_attention import (
-    radix_decode as mlx_radix_decode,
+from sglang.kernels.ops.attention.mlx.gated_delta import gdn_prefill as mlx_gdn_prefill
+from sglang.kernels.ops.attention.mlx.gated_delta_export import (
+    gdn_decode,
+    gdn_prefill,
 )
 from sglang.kernels.ops.attention.mlx.radix_attention_export import (
     radix_decode,
@@ -29,9 +31,17 @@ from sglang.srt.hardware_backend.mps.compiled_region import (
     discover_decode_region,
     static_metadata_matches,
 )
+from sglang.srt.hardware_backend.mps.compiled_state import (
+    commit_gdn_state,
+    conv_weight,
+    conv_weight_path,
+    gdn_state_contract,
+    stateful_ops,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import (
@@ -82,6 +92,7 @@ def _plain_prefill(batch):
         and batch.replace_embeds is None
         and batch.spec_info is None
         and batch.encoder_lens is None
+        and not any(item is not None for item in batch.mm_inputs or ())
     )
 
 
@@ -93,6 +104,7 @@ class _PendingDecode(msgspec.Struct, frozen=True, kw_only=True):
     lengths: tuple[int, ...]
     positions: tuple[int, ...]
     generations: tuple[int, ...]
+    state_slots: tuple[int, ...]
     locations: tuple[int, ...]
     weights: tuple
     owners: tuple[MlxTensorView, ...]
@@ -116,15 +128,40 @@ def _plain_greedy(info):
 
 
 class _ExportAttention(AttentionBackend):
-    def __init__(self, *, cache, kv_pool, layers, prefill=False):
+    def __init__(
+        self, *, cache, kv_pool, region, state=None, weights=None, prefill=False
+    ):
         self.cache = cache
         self.token_to_kv_pool = kv_pool
+        self.state = state
+        self.weights = weights
         self.keys = []
         self.values = []
-        self.layers = layers
+        self.convs = []
+        self.ssms = []
+        self.layers = region.layers
+        self.linear_layers = region.linear_layers
         self.prefill = prefill
 
-    def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+    def forward(
+        self,
+        q=None,
+        k=None,
+        v=None,
+        layer=None,
+        forward_batch=None,
+        save_kv_cache=True,
+        mixed_qkv=None,
+        a=None,
+        b=None,
+        **kwargs,
+    ):
+        if isinstance(layer, RadixLinearAttention):
+            return self._linear(layer, forward_batch, mixed_qkv, a, b, kwargs)
+        if mixed_qkv is not None:
+            raise UnsupportedMlxRegion(
+                "MLX graph decode requires one mixer kind per decoder block"
+            )
         if not save_kv_cache or kwargs:
             raise UnsupportedMlxRegion(
                 "MLX graph decode requires ordinary self-attention"
@@ -163,14 +200,65 @@ class _ExportAttention(AttentionBackend):
         )
         return result.reshape(q.shape[0], -1)
 
+    def _linear(self, layer, forward_batch, mixed_qkv, a, b, kwargs):
+        if kwargs or not isinstance(mixed_qkv, torch.Tensor) or self.state is None:
+            raise UnsupportedMlxRegion("MLX graph GDN requires a plain mixed qkv")
+        index = len(self.convs)
+        if (
+            index >= len(self.linear_layers)
+            or self.linear_layers[index].layer_id != layer.layer_id
+        ):
+            raise UnsupportedMlxRegion(
+                "MLX GDN invocation order differs from decoder stack"
+            )
+        geometric = dict(
+            num_k_heads=layer.num_k_heads,
+            head_k_dim=layer.head_k_dim,
+            head_v_dim=layer.head_v_dim,
+        )
+        weight = conv_weight(*self.weights[index])
+        if self.prefill:
+            out, conv, ssm = gdn_prefill(
+                mixed_qkv,
+                a,
+                b,
+                weight,
+                layer.bias,
+                layer.A_log,
+                layer.dt_bias,
+                conv_dtype=self.state.conv.dtype,
+                ssm_dtype=self.state.ssm.dtype,
+                **geometric,
+            )
+        else:
+            out, conv, ssm = gdn_decode(
+                mixed_qkv,
+                a,
+                b,
+                weight,
+                layer.bias,
+                layer.A_log,
+                layer.dt_bias,
+                self.cache.conv,
+                self.cache.ssm,
+                self.cache.state_table,
+                forward_batch.req_pool_indices,
+                layer=index,
+                **geometric,
+            )
+        self.convs.append(conv)
+        self.ssms.append(ssm)
+        return out
+
 
 class _DecodeModule(torch.nn.Module):
-    def __init__(self, *, model, req_pool, kv_pool, region, prefill=False):
+    def __init__(self, *, model, req_pool, kv_pool, region, state=None, prefill=False):
         super().__init__()
         self.model = model
         self.region = region
         self.static_reads = {}
         self.prefill = prefill
+        self._mrope = vars(model).get("is_mrope_enabled", False)
         self.cache = torch.nn.Module()
         if not prefill:
             self.cache.register_buffer("table", req_pool.req_to_token)
@@ -178,10 +266,19 @@ class _DecodeModule(torch.nn.Module):
                 k, v = kv_pool.get_kv_buffer(layer.layer_id)
                 self.cache.register_buffer(f"k_{layer.layer_id}", k)
                 self.cache.register_buffer(f"v_{layer.layer_id}", v)
+            if state is not None:
+                self.cache.register_buffer("state_table", state.table)
+                self.cache.register_buffer("conv", state.conv)
+                self.cache.register_buffer("ssm", state.ssm)
         self.attention = _ExportAttention(
             cache=self.cache,
             kv_pool=kv_pool,
-            layers=region.layers,
+            region=region,
+            state=state,
+            weights=tuple(
+                (model, conv_weight_path(model, layer), layer.conv_weights.shape)
+                for layer in region.linear_layers
+            ),
             prefill=prefill,
         )
 
@@ -197,7 +294,11 @@ class _DecodeModule(torch.nn.Module):
             seq_lens_sum=input_ids.shape[0] if self.prefill else 0,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_token_non_padded_cpu=input_ids.shape[0],
+            mm_inputs=[None] if self.prefill else None,
         )
+        # Text-only MRoPE rows are identical, so its rotation equals 1-D RoPE.
+        if self._mrope:
+            batch.mrope_positions = positions
         if self.prefill:
             tokens = input_ids.shape[0]
             batch.extend_num_tokens = tokens
@@ -210,6 +311,8 @@ class _DecodeModule(torch.nn.Module):
         batch.track_reads(self.static_reads)
         self.attention.keys = []
         self.attention.values = []
+        self.attention.convs = []
+        self.attention.ssms = []
         arguments = {
             "input_ids": input_ids,
             self.region.position_arg: positions,
@@ -237,15 +340,18 @@ class _DecodeModule(torch.nn.Module):
             or result.next_token_logits.shape[0] != batch.batch_size
         ):
             raise UnsupportedMlxRegion("MLX requires one logits row per decode token")
-        if len(self.attention.keys) != len(self.region.layers):
-            raise UnsupportedMlxRegion(
-                "MLX forward did not invoke every decoder attention"
-            )
-        return (
-            result.next_token_logits,
-            torch.stack(self.attention.keys),
-            torch.stack(self.attention.values),
-        )
+        if len(self.attention.keys) != len(self.region.layers) or len(
+            self.attention.convs
+        ) != len(self.region.linear_layers):
+            raise UnsupportedMlxRegion("MLX forward did not invoke every decoder mixer")
+        outputs = [result.next_token_logits]
+        if self.region.layers:
+            outputs.append(torch.stack(self.attention.keys))
+            outputs.append(torch.stack(self.attention.values))
+        if self.region.linear_layers:
+            outputs.append(torch.stack(self.attention.convs))
+            outputs.extend(self.attention.ssms)
+        return tuple(outputs)
 
 
 class _BatchInputs(NamedTuple):
@@ -286,9 +392,13 @@ class CompiledMlxRunner(BaseRunner):
         self._region = None
         if model_runner.is_draft_worker or model_runner.spec_algorithm.is_speculative():
             raise ValueError("MLX graph decode does not support speculative decoding")
-        if not isinstance(model_runner.token_to_kv_pool, MHATokenToKVPool):
-            raise TypeError("MLX graph decode requires the standard MHA KV pool")
+        if not isinstance(
+            model_runner.token_to_kv_pool, (MHATokenToKVPool, HybridLinearKVPool)
+        ):
+            raise TypeError("MLX graph decode requires a Torch-owned KV pool")
         self._layers = ()
+        self._linear_layers = ()
+        self._state = None
         self._init_backend()
         self._max_batch_size = min(16, model_runner.req_to_token_pool.size)
         self._graphs = {}
@@ -346,6 +456,12 @@ class CompiledMlxRunner(BaseRunner):
             or forward_batch.spec_info is not None
         ):
             reason = "embedding or speculative inputs"
+        elif self._linear_layers and (
+            forward_batch.mamba_track_mask is not None
+            or forward_batch.mamba_track_indices is not None
+            or any(item is not None for item in forward_batch.mm_inputs or ())
+        ):
+            reason = "state tracking or multimodal inputs"
         elif forward_batch.capture_hidden_mode not in (None, CaptureHiddenMode.NULL):
             reason = "hidden-state capture"
         elif forward_batch.lora_ids and any(forward_batch.lora_ids):
@@ -414,9 +530,25 @@ class CompiledMlxRunner(BaseRunner):
             self._region = None
             self._unsupported_reason = str(error)
             self._layers = ()
+            self._linear_layers = ()
+            self._state = None
         else:
-            self._unsupported_reason = None
             self._layers = self._region.layers
+            self._linear_layers = self._region.linear_layers
+            self._unsupported_reason = self._state_contract()
+        if self._unsupported_reason is not None:
+            self.drain(discard=True, reason="unsupported")
+
+    def _state_contract(self):
+        """Admit the region's recurrent state, or say why it stays on eager MPS."""
+        if not self._linear_layers:
+            self._state = None
+            return None
+        contract = gdn_state_contract(self.model_runner, self._region)
+        if isinstance(contract, str):
+            return contract
+        self._state = contract
+        return None
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs):
         return forward_batch
@@ -431,29 +563,17 @@ class CompiledMlxRunner(BaseRunner):
         requests = host_alias(batch.req_pool_indices).tolist()
         lengths = host_alias(batch.seq_lens).tolist()
         locations = host_alias(batch.out_cache_loc).tolist()
-        pool = self.model_runner.token_to_kv_pool
-        slots = pool.get_key_buffer(self._layers[0].layer_id).shape[0]
         if len(set(requests)) != len(requests):
             raise ValueError("MLX graph decode requires unique request rows")
         if len(set(locations)) != len(locations):
             raise ValueError("MLX graph decode requires unique KV write locations")
-        for request, length, location in zip(requests, lengths, locations):
-            if not (
-                0 <= request < table.shape[0]
-                and 1 <= length <= table.shape[1]
-                and 0 < location < slots
-            ):
-                raise ValueError(
-                    "Invalid MLX graph decode request, length or KV location"
-                )
-            if table[request, length - 1].item() != location:
-                raise ValueError(
-                    "MLX graph decode KV write location disagrees with table"
-                )
-            prefix = table[request, : length - 1]
-            if bool(((prefix <= 0) | (prefix >= slots)).any()):
-                raise ValueError("Invalid MLX graph decode prefix KV slots")
-            validate_page_slots(table[request, :length], pool.page_size)
+        for request, length in zip(requests, lengths):
+            if not 0 <= request < table.shape[0] or not 1 <= length <= table.shape[1]:
+                raise ValueError("Invalid MLX graph decode request or length")
+        if self._layers:
+            self._validate_kv_slots(table, requests, lengths, locations)
+        if self._state is not None:
+            self._validate_state_slots(requests)
         ids = host_alias(batch.input_ids)
         positions = host_alias(batch.positions)
         if bool(((ids < 0) | (ids >= self.model_runner.model.config.vocab_size)).any()):
@@ -465,6 +585,30 @@ class CompiledMlxRunner(BaseRunner):
             ).any()
         ):
             raise ValueError("Compiled MLX position is outside the context")
+
+    def _validate_kv_slots(self, table, requests, lengths, locations):
+        pool = self.model_runner.token_to_kv_pool
+        slots = pool.get_key_buffer(self._layers[0].layer_id).shape[0]
+        for request, length, location in zip(requests, lengths, locations):
+            if not 0 < location < slots:
+                raise ValueError("Invalid MLX graph decode KV location")
+            if table[request, length - 1].item() != location:
+                raise ValueError(
+                    "MLX graph decode KV write location disagrees with table"
+                )
+            prefix = table[request, : length - 1]
+            if bool(((prefix <= 0) | (prefix >= slots)).any()):
+                raise ValueError("Invalid MLX graph decode prefix KV slots")
+            validate_page_slots(table[request, :length], pool.page_size)
+
+    def _validate_state_slots(self, requests):
+        state = self._state
+        slots = host_alias(state.table)[requests]
+        # Slot 0 is the padding sink no request may own.
+        if not state.conv.shape[1] > int(slots.max()):
+            raise ValueError("MLX gated delta state slot is outside the pool")
+        if bool((slots <= 0).any()) or len(set(slots.tolist())) != len(slots):
+            raise ValueError("MLX gated delta state slots are shared or the sink")
 
     def _validate_prefill_metadata(self, batch):
         tokens = batch.input_ids.numel()
@@ -486,8 +630,6 @@ class CompiledMlxRunner(BaseRunner):
         table = host_alias(self.model_runner.req_to_token_pool.req_to_token)
         request = host_alias(batch.req_pool_indices).item()
         locations = host_alias(batch.out_cache_loc)
-        pool = self.model_runner.token_to_kv_pool
-        slots = pool.get_key_buffer(self._layers[0].layer_id).shape[0]
         if (
             not 0 <= request < table.shape[0]
             or tokens > min(table.shape[1], self.model_runner.model_config.context_len)
@@ -495,12 +637,20 @@ class CompiledMlxRunner(BaseRunner):
             or host_alias(batch.extend_seq_lens).item() != tokens
             or host_alias(batch.extend_prefix_lens).item() != 0
             or host_alias(batch.extend_start_loc).item() != 0
-            or bool(((locations <= 0) | (locations >= slots)).any())
-            or locations.unique().numel() != tokens
-            or not torch.equal(table[request, :tokens].long(), locations.long())
         ):
-            raise ValueError("Invalid MLX prefill length or KV mapping")
-        validate_page_slots(locations, pool.page_size)
+            raise ValueError("Invalid MLX prefill length")
+        if self._layers:
+            pool = self.model_runner.token_to_kv_pool
+            slots = pool.get_key_buffer(self._layers[0].layer_id).shape[0]
+            if (
+                bool(((locations <= 0) | (locations >= slots)).any())
+                or locations.unique().numel() != tokens
+                or not torch.equal(table[request, :tokens].long(), locations.long())
+            ):
+                raise ValueError("Invalid MLX prefill KV mapping")
+            validate_page_slots(locations, pool.page_size)
+        if self._state is not None:
+            self._validate_state_slots([request])
         ids = host_alias(batch.input_ids)
         if bool(((ids < 0) | (ids >= self.model_runner.model.config.vocab_size)).any()):
             raise ValueError("Compiled MLX input token is outside the vocabulary")
@@ -516,9 +666,14 @@ class CompiledMlxRunner(BaseRunner):
             for layer in self._layers
             for tensor in mr.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         )
+        state_pools = (
+            (self._state.table, self._state.conv, self._state.ssm)
+            if self._state is not None
+            else ()
+        )
         identity = (id(mr.model),) + tuple(
             (tensor.data_ptr(), tensor.shape, tensor.dtype)
-            for tensor in (mr.req_to_token_pool.req_to_token, *pools)
+            for tensor in (mr.req_to_token_pool.req_to_token, *pools, *state_pools)
         )
         if self._pool_identity != identity:
             self.drain(discard=True, reason="pool")
@@ -526,8 +681,9 @@ class CompiledMlxRunner(BaseRunner):
                 graph.close()
             self._graphs.clear()
             self._pool_identity = identity
+        dynamic = self._prefill and batch.input_ids.numel() >= 2
         size = batch.input_ids.numel() if self._prefill else batch.batch_size
-        key = "prefill" if self._prefill and size >= 2 else size
+        key = "prefill" if dynamic else size
         if key not in self._graphs:
             wrapper = self._make_wrapper()
             start = time.perf_counter()
@@ -550,15 +706,18 @@ class CompiledMlxRunner(BaseRunner):
             finally:
                 wrapper.attention.keys.clear()
                 wrapper.attention.values.clear()
+                wrapper.attention.convs.clear()
+                wrapper.attention.ssms.clear()
             elapsed = time.perf_counter() - start
             self.compile_seconds += elapsed
             self._graphs[key] = graph
             logger.info(
-                "%s %s graph ready: size=%d, page_size=%d, prepare=%.3fs",
+                "%s %s graph ready: size=%d, page_size=%d, gdn_layers=%d, prepare=%.3fs",
                 type(graph).__name__,
                 "prefill" if self._prefill else "decode",
                 size,
                 mr.token_to_kv_pool.page_size,
+                len(self._linear_layers),
                 elapsed,
             )
         else:
@@ -634,20 +793,25 @@ class CompiledMlxRunner(BaseRunner):
             req_pool=mr.req_to_token_pool,
             kv_pool=mr.token_to_kv_pool,
             region=self._region,
+            state=self._state,
             prefill=self._prefill,
         ).eval()
 
     def _compile(self, wrapper, batch):
+        custom_lowerings = {}
+        if self._prefill:
+            custom_lowerings[torch.ops.aten.scaled_dot_product_attention.default] = (
+                _causal_sdpa
+            )
+            if self._linear_layers:
+                custom_lowerings[gdn_prefill._opoverload] = mlx_gdn_prefill
+        stateful = stateful_ops(self._region, prefill=self._prefill)
         return CompiledMlxGraph(
             model=wrapper,
             example_inputs=_batch_inputs(batch),
-            attention=mlx_radix_decode,
-            custom_lowerings=(
-                {torch.ops.aten.scaled_dot_product_attention.default: _causal_sdpa}
-                if self._prefill
-                else None
-            ),
+            custom_lowerings=custom_lowerings or None,
             dynamic_tokens=self._prefill and batch.input_ids.numel() >= 2,
+            stateful=stateful,
         )
 
     def drain(self, *, discard=False, reason="explicit"):
@@ -681,7 +845,14 @@ class CompiledMlxRunner(BaseRunner):
             tuple(host_alias(batch.seq_lens).tolist()),
             tuple(host_alias(batch.positions).tolist()),
             tuple(generations[list(requests)].tolist()),
+            self._state_slots(requests),
         )
+
+    def _state_slots(self, requests):
+        """Each request's state slot, so a lookahead hit cannot read another slot."""
+        if self._state is None:
+            return ()
+        return tuple(host_alias(self._state.table)[list(requests)].tolist())
 
     def _consume(self, *, graph, batch, metadata, weights):
         pending = self._pending
@@ -697,6 +868,7 @@ class CompiledMlxRunner(BaseRunner):
             pending.lengths,
             pending.positions,
             pending.generations,
+            pending.state_slots,
         ):
             reason = "metadata"
         elif weights != pending.weights:
@@ -717,7 +889,7 @@ class CompiledMlxRunner(BaseRunner):
         return None
 
     def _prefetch(self, *, graph, arrays, outputs, batch, metadata, weights):
-        requests, lengths, positions, generations = metadata
+        requests, lengths, positions, generations, state_slots = metadata
         if (
             not self._async
             or not _plain_greedy(batch.sampling_info)
@@ -737,11 +909,18 @@ class CompiledMlxRunner(BaseRunner):
             lengths=tuple(n + 1 for n in lengths),
             positions=tuple(p + 1 for p in positions),
             generations=generations,
+            state_slots=state_slots,
             locations=tuple(host_alias(batch.out_cache_loc).tolist()),
             weights=weights,
             owners=tuple(graph.views.values()),
         )
         self.prefetch_count += 1
+
+    def _commit_state(self, forward_batch, conv_rows, *ssm_rows):
+        state = self._state
+        requests = host_alias(forward_batch.req_pool_indices).tolist()
+        slots = host_alias(state.table)[requests].long().to(state.conv.device)
+        commit_gdn_state(state, slots=slots, conv_rows=conv_rows, ssm_rows=ssm_rows)
 
     @torch.no_grad()
     def execute(self, forward_batch, **kwargs):
@@ -776,13 +955,20 @@ class CompiledMlxRunner(BaseRunner):
                     weights=weights,
                 )
         mx.eval(*outputs)
-        logits, keys, values = tuple(
+        exported = tuple(
             _export_evaluated_mlx(array, torch.device("mps"), mx) for array in outputs
         )
-        for index, layer in enumerate(self._layers):
-            self.model_runner.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, keys[index], values[index]
-            )
+        logits = exported[0]
+        offset = 1
+        if self._layers:
+            keys, values = exported[offset], exported[offset + 1]
+            offset += 2
+            for index, layer in enumerate(self._layers):
+                self.model_runner.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, keys[index], values[index]
+                )
+        if self._linear_layers:
+            self._commit_state(forward_batch, *exported[offset:])
         self.execution_count += 1
         if self._prefill:
             logger.debug(

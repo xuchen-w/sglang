@@ -1087,7 +1087,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
-        if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
+        if not use_strided_prefill_z and _fp8_tuple_input(
+            self.out_proj, z.shape[0] // nv
+        ):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,
                 self.norm.weight,

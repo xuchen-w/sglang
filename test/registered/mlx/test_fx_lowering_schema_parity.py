@@ -151,6 +151,8 @@ _RECIPES: dict[str, dict] = {
     "sigmoid": dict(args=lambda: (_t(4, 4),)),
     "tanh": dict(args=lambda: (_t(4, 4),)),
     "rsqrt": dict(args=lambda: (_positive(4, 4),)),
+    "square": dict(args=lambda: (_t(4, 4),)),
+    "reciprocal": dict(args=lambda: (_positive(4, 4),)),
     "index_select": dict(args=lambda: (_t(5, 6), 1, _indices(3, 6))),
     "layer_norm": dict(
         args=lambda: (_t(4, 8), [8]),

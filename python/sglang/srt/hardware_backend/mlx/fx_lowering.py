@@ -739,6 +739,16 @@ def _lower_numpy_transpose(mx, args, kwargs):
     return mx.transpose(args[0], axes=tuple(reversed(range(args[0].ndim))))
 
 
+@mlx_lowering("square", aten=(torch.ops.aten.square.default,))
+def _lower_square(mx, args, kwargs):
+    return mx.square(args[0])
+
+
+@mlx_lowering("reciprocal", aten=(torch.ops.aten.reciprocal.default,))
+def _lower_reciprocal(mx, args, kwargs):
+    return mx.reciprocal(args[0])
+
+
 @mlx_lowering("power", aten=(torch.ops.aten.pow.Tensor_Scalar,))
 def _lower_power(mx, args, kwargs):
     return mx.power(args[0], args[1])

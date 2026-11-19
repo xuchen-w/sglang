@@ -162,14 +162,25 @@ eager while using eligible compiled prefill, add
 - Dense, unquantized models on a single rank, with decode batches of 1-16.
   Qwen3-0.6B, SmolLM2-135M and GPT-2 have been checked; other models must pass
   structural and operator-coverage checks.
+- Hybrid Gated DeltaNet models such as Qwen3.5, served with
+  `--json-model-override-args '{"language_model_only":true}'`, decode batches
+  of 1-16 and compiled batch-1 uncached
+  prefill. The recurrent conv and SSM state is read from the Mamba pool by
+  request slot and committed back after each step, including during lookahead.
+  Qwen3.5-0.8B has been checked against an fp32 CPU greedy reference in fp32
+  and against eager MPS in bfloat16.
 - Standard Torch-owned MHA KV pools and local radix caching. Keep page size 1
   by default. Sizes 16, 32 and 64 are supported, but larger pages reduce prefix
-  sharing granularity and may waste partially filled slots.
+  sharing granularity and may waste partially filled slots. Hybrid models need
+  page size 1 and the `no_buffer` state tracking strategy, so a decode batch
+  carrying tracking fields goes to eager MPS.
 - Ineligible prefill, other unsupported batches and unsupported model regions use eager
   MPS with a fallback log. Unexpected execution errors are not silently retried.
-- LoRA, speculative decoding, MoE/recurrent models, distributed execution,
-  memory saver, alternate KV layouts and external/disaggregated caches are
-  unsupported.
+- LoRA, speculative decoding, MoE, quantization, distributed execution, memory
+  saver, alternate KV layouts and external/disaggregated caches are
+  unsupported. Linear attention other than Gated DeltaNet (KDA, Lightning) and
+  hybrid pools that are not a static single-conv Mamba pool pair also stay on
+  eager MPS.
 
 The scheduler enables one-token read-only lookahead for eligible greedy requests.
 Torch sampling remains authoritative, and only accepted tokens are committed

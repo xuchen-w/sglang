@@ -9,6 +9,7 @@ import msgspec
 import torch
 
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
@@ -17,10 +18,35 @@ class UnsupportedMlxRegion(ValueError):
     pass
 
 
+# One sequence mixer per decoder block: full attention or a linear-attention
+# layer. Hybrid models use both kinds in the same stack.
+STATEFUL_LAYERS = (RadixAttention, RadixLinearAttention)
+
+
 class DecodeRegion(msgspec.Struct, frozen=True, kw_only=True):
     layers: tuple[RadixAttention, ...]
+    linear_layers: tuple[RadixLinearAttention, ...]
     position_arg: str
     pass_pp_proxy: bool
+
+
+def _check_gdn(layer: RadixLinearAttention) -> None:
+    """GDN geometry the compiled graph can express, or an unsupported region."""
+    weight = layer.conv_weights
+    if (
+        not isinstance(weight, torch.Tensor)
+        or weight.ndim != 2
+        or weight.shape[0] != 2 * layer.k_dim + layer.v_dim
+        or weight.shape[1] < 2
+        or layer.num_q_heads != layer.num_k_heads
+        or layer.head_q_dim != layer.head_k_dim
+        or layer.head_k_dim % 32
+        or layer.head_v_dim % 4
+        or layer.num_v_heads % layer.num_k_heads
+        or layer.activation not in ("silu", "swish")
+        or layer.lower_bound is not None
+    ):
+        raise UnsupportedMlxRegion("Unsupported MLX graph GDN geometry")
 
 
 def discover_decode_region(model: torch.nn.Module) -> DecodeRegion:
@@ -29,7 +55,7 @@ def discover_decode_region(model: torch.nn.Module) -> DecodeRegion:
         (name, module)
         for name, module in modules
         if isinstance(module, (torch.nn.ModuleList, torch.nn.ModuleDict))
-        and any(isinstance(child, RadixAttention) for child in module.modules())
+        and any(isinstance(child, STATEFUL_LAYERS) for child in module.modules())
     ]
     stacks = [
         (name, module)
@@ -38,26 +64,30 @@ def discover_decode_region(model: torch.nn.Module) -> DecodeRegion:
     ]
     if len(stacks) != 1:
         raise UnsupportedMlxRegion("MLX requires exactly one decoder stack")
-    layers = tuple(
-        module for _, module in modules if isinstance(module, RadixAttention)
+    mixers = tuple(
+        module for _, module in modules if isinstance(module, STATEFUL_LAYERS)
     )
-    stack_layers = tuple(
+    stack_mixers = tuple(
         module
         for _, module in stacks[0][1].named_modules(remove_duplicate=False)
-        if isinstance(module, RadixAttention)
+        if isinstance(module, STATEFUL_LAYERS)
     )
-    if layers != stack_layers or len({id(x) for x in layers}) != len(layers):
-        raise UnsupportedMlxRegion("MLX requires unique attention modules in one stack")
-    if len({x.layer_id for x in layers}) != len(layers):
+    if mixers != stack_mixers or len({id(x) for x in mixers}) != len(mixers):
+        raise UnsupportedMlxRegion("MLX requires unique mixer modules in one stack")
+    if len({x.layer_id for x in mixers}) != len(mixers):
         raise UnsupportedMlxRegion("MLX requires unique attention layer IDs")
     for block in stacks[0][1].children():
-        if sum(isinstance(x, RadixAttention) for x in block.modules()) != 1:
+        if sum(isinstance(x, STATEFUL_LAYERS) for x in block.modules()) != 1:
             raise UnsupportedMlxRegion(
                 "MLX requires one attention invocation per block"
             )
+    layers = tuple(x for x in mixers if isinstance(x, RadixAttention))
+    linear_layers = tuple(x for x in mixers if isinstance(x, RadixLinearAttention))
     geometry = {(x.tp_k_head_num, x.head_dim) for x in layers}
-    if len(geometry) != 1:
+    if len(geometry) > 1:
         raise UnsupportedMlxRegion("MLX requires homogeneous KV geometry")
+    for layer in linear_layers:
+        _check_gdn(layer)
     for layer in layers:
         if (
             layer.head_dim not in (64, 128, 256)
@@ -89,11 +119,15 @@ def discover_decode_region(model: torch.nn.Module) -> DecodeRegion:
         if parameter.kind in (
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD,
-        ) or (name not in supplied and parameter.default is inspect.Parameter.empty):
+        ) or (
+            parameter.kind is not inspect.Parameter.VAR_KEYWORD
+            and name not in supplied
+            and parameter.default is inspect.Parameter.empty
+        ):
             raise UnsupportedMlxRegion(f"Unsupported MLX forward argument: {name}")
     return DecodeRegion(
         layers=layers,
+        linear_layers=linear_layers,
         position_arg=positions[0],
         pass_pp_proxy="pp_proxy_tensors" in parameters,
     )
@@ -109,6 +143,7 @@ class RegionBatch(ForwardBatch):
             if name in (
                 "input_ids",
                 "positions",
+                "mrope_positions",
                 "req_pool_indices",
                 "seq_lens",
                 "out_cache_loc",
@@ -136,6 +171,12 @@ class RegionBatch(ForwardBatch):
             ):
                 state["_static_reads"].setdefault(name, list(value))
                 return value
+            # A text-only multimodal model reads its per-request inputs, which
+            # stay None for every text batch.
+            if name == "mm_inputs" and isinstance(value, list):
+                if all(item is None for item in value):
+                    return value
+                raise UnsupportedMlxRegion("MLX cannot replay multimodal inputs")
             if value is not None and not isinstance(
                 value, (bool, int, float, str, Enum)
             ):

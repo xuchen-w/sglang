@@ -7,6 +7,7 @@ import operator
 from collections.abc import Callable, Mapping
 
 import mlx.core as mx
+import msgspec
 import torch
 from torch.export.graph_signature import InputKind, OutputKind
 
@@ -99,6 +100,32 @@ def _weighted_rms_pattern(node, norms):
     return None
 
 
+class StatefulOp(msgspec.Struct, frozen=True):
+    """One read-only custom op whose graph arguments carry pending state.
+
+    ``tail_args`` are the op's own explicit pending-state arguments.
+    ``tails[n]`` locates the pending inputs of the nth invocation in the
+    launch-wide flat tail tuple: a (position, sub-index | None) pair, where a
+    None sub-index means the whole entry is that invocation's value.
+    ``tail_width`` is how many entries this op kind owns in that tuple.
+    """
+
+    fn: Callable
+    tail_args: tuple[str, ...]
+    tails: tuple[tuple[tuple[int, int | None], ...], ...]
+    tail_width: int
+
+
+def radix_stateful_op(fn, count: int, *, offset: int = 0) -> StatefulOp:
+    """The tail layout of ``count`` radix invocations: one K stack, one V stack."""
+    return StatefulOp(
+        fn=fn,
+        tail_args=("tail_k", "tail_v"),
+        tails=tuple(((offset, index), (offset + 1, index)) for index in range(count)),
+        tail_width=2,
+    )
+
+
 class CompiledMlxGraph:
     """Read-only export with retained, replaceable Torch storage."""
 
@@ -111,9 +138,11 @@ class CompiledMlxGraph:
         attention=None,
         custom_lowerings: Mapping[torch._ops.OpOverload, Callable] | None = None,
         dynamic_tokens=False,
+        stateful: Mapping[torch._ops.OpOverload, StatefulOp] | None = None,
     ):
         self.model = model
         self.attention = attention
+        self.stateful = dict(stateful or {})
         self.dynamic_tokens = dynamic_tokens
         self.input_signatures = tuple(_signature(x) for x in example_inputs)
         shapes = None
@@ -157,10 +186,20 @@ class CompiledMlxGraph:
                 radix_decode,
             )
 
-            registry.register_function(
+            self.stateful.setdefault(
                 radix_decode._opoverload,
-                lambda mx, args, kwargs: attention(*args, **kwargs),
+                radix_stateful_op(
+                    attention,
+                    sum(node.target is radix_decode._opoverload for node in self.nodes),
+                ),
             )
+        for target, op in self.stateful.items():
+            registry.register_function(
+                target, lambda mx, args, kwargs, fn=op.fn: fn(*args, **kwargs)
+            )
+        self.tail_width = max(
+            (op.tail_width for op in self.stateful.values()), default=0
+        )
         self.plan = build_mlx_fx_plan(exported.graph_module, registry)
         try:
             self.plan.require_fully_supported()
@@ -224,7 +263,9 @@ class CompiledMlxGraph:
     def _function(self, tail):
         def forward(*flat):
             values = {}
-            position = layer = 0
+            position = 0
+            tails_in = flat[len(flat) - self.tail_width :] if tail else ()
+            counters = dict.fromkeys(self.stateful, 0)
             for node, node_plan in zip(self.nodes, self.plan.nodes):
                 if node.op == "placeholder":
                     values[node] = flat[position]
@@ -250,29 +291,28 @@ class CompiledMlxGraph:
                 elif node in self.norms:
                     x, eps = self.norms[node]
                     values[node] = mx.fast.rms_norm(values[x], None, eps)
-                elif str(node.target) == "sglang.mlx_radix_decode.default":
-                    if self.attention is None:
-                        raise ValueError("Radix attention lowering was not provided")
+                elif (op := self.stateful.get(node.target)) is not None:
                     arguments = node.target._schema.arguments
                     kw = {
                         **{arg.name: value for arg, value in zip(arguments, args)},
                         **kw,
                     }
-                    tail_k, tail_v = kw.pop("tail_k", None), kw.pop("tail_v", None)
+                    explicit = tuple(kw.pop(name, None) for name in op.tail_args)
                     args = tuple(
                         kw.pop(arg.name)
                         for arg in arguments
-                        if not arg.kwarg_only and arg.name not in ("tail_k", "tail_v")
+                        if not arg.kwarg_only and arg.name in kw
                     )
-                    tails = (
-                        (flat[-2][layer], flat[-1][layer])
-                        if tail
-                        else (tail_k, tail_v)
-                        if tail_k is not None
-                        else None
-                    )
-                    values[node] = self.attention(*args, **kw, tails=tails)
-                    layer += 1
+                    index = counters[node.target]
+                    counters[node.target] += 1
+                    if tail:
+                        tails = tuple(
+                            tails_in[p] if sub is None else tails_in[p][sub]
+                            for p, sub in op.tails[index]
+                        )
+                    else:
+                        tails = explicit if explicit[0] is not None else None
+                    values[node] = op.fn(*args, **kw, tails=tails)
                 else:
                     values[node] = node_plan.implementation(mx, args, kw)
             raise ValueError("Direct MLX graph has no output")
