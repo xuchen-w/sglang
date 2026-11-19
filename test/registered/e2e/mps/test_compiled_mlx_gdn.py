@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_mps_ci(est_time=600, suite="stage-b-e2e-mps")
+register_mps_ci(est_time=600, suite="extra-e2e-test-mps")
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 
